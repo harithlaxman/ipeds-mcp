@@ -6,6 +6,7 @@ no per-table type guessing happens and the same column has the same type in
 every year's table.
 """
 
+import argparse
 import os
 import re
 import subprocess
@@ -14,7 +15,6 @@ import tempfile
 import duckdb
 from tqdm import tqdm
 
-ADBS_PATH = "./data/accdb/"
 DB_PATH = "ipeds.db"
 # Fixed date format we ask mdb-export to emit, and tell duckdb to expect.
 DATE_FMT = "%Y-%m-%d %H:%M:%S"
@@ -99,18 +99,26 @@ def columns_struct(cols: dict[str, str]) -> str:
 
 
 def main() -> None:
-    if os.path.exists(DB_PATH):
-        raise SystemExit(f"{DB_PATH} already exists; remove it first to re-ingest.")
+    parser = argparse.ArgumentParser(description="Ingest IPEDS Access DBs into duckdb.")
+    parser.add_argument("--accdb-dir", default="./data/accdb/", help="Directory containing .accdb files (default: ./data/accdb/)")
+    parser.add_argument("--db", default=DB_PATH, help=f"Output duckdb path (default: {DB_PATH})")
+    args = parser.parse_args()
 
-    con = duckdb.connect(DB_PATH)
+    adbs_path = args.accdb_dir
+    db_path = args.db
+
+    if os.path.exists(db_path):
+        raise SystemExit(f"{db_path} already exists; remove it first to re-ingest.")
+
+    con = duckdb.connect(db_path)
     seen: dict[str, str] = {}  # table -> source db, to catch name collisions
 
-    dbs = sorted(os.listdir(ADBS_PATH))
+    dbs = sorted(os.listdir(adbs_path))
     for db in tqdm(dbs, desc="years"):
-        db_path = os.path.join(ADBS_PATH, db)
+        accdb = os.path.join(adbs_path, db)
         year = start_year(db)
         tables = subprocess.run(
-            ["mdb-tables", "-1", db_path],
+            ["mdb-tables", "-1", accdb],
             capture_output=True, text=True, check=True,
         ).stdout.split()
 
@@ -120,15 +128,15 @@ def main() -> None:
                 dest += "_meta"
             if dest in seen:
                 raise SystemExit(
-                    f"Duplicate table name {dest!r} in {db_path} "
+                    f"Duplicate table name {dest!r} in {accdb} "
                     f"(first seen in {seen[dest]}). Resolve naming before ingest."
                 )
-            seen[dest] = db_path
+            seen[dest] = accdb
 
-            cols = get_schema(db_path, table)
+            cols = get_schema(accdb, table)
 
             csv = subprocess.run(
-                ["mdb-export", "-D", DATE_FMT, "-q", '"', "-X", '"', db_path, table],
+                ["mdb-export", "-D", DATE_FMT, "-q", '"', "-X", '"', accdb, table],
                 capture_output=True, text=True, check=True,
             ).stdout
 
@@ -149,7 +157,7 @@ def main() -> None:
                 os.unlink(tmp)
 
     con.close()
-    print(f"Done. Ingested {len(seen)} tables into {DB_PATH}.")
+    print(f"Done. Ingested {len(seen)} tables into {db_path}.")
 
 
 if __name__ == "__main__":

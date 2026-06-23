@@ -1,9 +1,13 @@
+import argparse
 import re
 
 import duckdb
 from mcp.server.fastmcp import FastMCP
 
-DB_PATH = "./data/ipeds.db"
+_parser = argparse.ArgumentParser(description="IPEDS MCP server")
+_parser.add_argument("--db", default="./data/ipeds.db", help="Path to the DuckDB database file")
+_args, _ = _parser.parse_known_args()
+DB_PATH = _args.db
 _YEAR_PREFIX_RE = re.compile(r"^y\d{4}_", re.IGNORECASE)
 SERVER_CONTEXT = """
 This server provides read-only access to a duckdb instance containing 20 years of IPEDS data from
