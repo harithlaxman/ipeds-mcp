@@ -1,47 +1,59 @@
-"""Ingest IPEDS Access DBs into duckdb, preserving the original Access column types.
+"""Ingest IPEDS Access DBs into Postgres, preserving the original Access column types.
 
 Types come from `mdb-schema` (the real schema stored in the .accdb), not from
-sampling the CSV. duckdb then loads the exported CSV with that schema forced, so
-no per-table type guessing happens and the same column has the same type in
-every year's table.
+sampling the CSV. Postgres then loads the exported CSV via COPY with that schema
+forced, so no per-table type guessing happens and the same column has the same
+type in every year's table.
+
+Column names are lowercased so unquoted identifiers resolve in queries; table
+names keep their original mixed case (always quote them).
 """
 
 import argparse
 import os
 import re
 import subprocess
-import tempfile
 
-import duckdb
+import psycopg
 from tqdm import tqdm
 
-DB_PATH = "ipeds.db"
-# Fixed date format we ask mdb-export to emit, and tell duckdb to expect.
+ADBS_PATH = "../../data/ipeds_all/accdb/"
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://postgres:ipeds_pg@localhost:5432/ipeds_db"
+)
+# Fixed date format we ask mdb-export to emit; matches Postgres timestamp input.
 DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
-# Access type (as printed by `mdb-schema`, default backend) -> duckdb type.
+# Access type (as printed by `mdb-schema`, default backend) -> Postgres type.
 TYPE_MAP = {
     "Text": "VARCHAR",
     "Memo/Hyperlink": "VARCHAR",
     "GUID": "VARCHAR",
     "Replication ID": "VARCHAR",
     "Boolean": "BOOLEAN",
-    "Byte": "UTINYINT",
-    "Integer": "INTEGER",          # Access "Integer" is 16-bit; widen to be safe
+    "Byte": "SMALLINT",
+    "Integer": "INTEGER",  # Access "Integer" is 16-bit; widen to be safe
     "Long Integer": "INTEGER",
     "Single": "REAL",
-    "Double": "DOUBLE",
-    "Float": "DOUBLE",
-    "Currency": "DECIMAL(19,4)",
-    "Numeric": "DOUBLE",
-    "Decimal": "DOUBLE",
+    "Double": "DOUBLE PRECISION",
+    "Float": "DOUBLE PRECISION",
+    "Currency": "NUMERIC(19,4)",
+    "Numeric": "DOUBLE PRECISION",
+    "Decimal": "DOUBLE PRECISION",
     "DateTime": "TIMESTAMP",
     "DateTime (Short)": "TIMESTAMP",
-    "OLE": "BLOB",
-    "Binary": "BLOB",
+    "OLE": "BYTEA",
+    "Binary": "BYTEA",
 }
 
-METADATA_TABLES = ["tables", "valuesets", "sectiontable", "filenames", "vartable", "newvariables"]
+METADATA_TABLES = [
+    "tables",
+    "valuesets",
+    "sectiontable",
+    "filenames",
+    "vartable",
+    "newvariables",
+]
 
 # Matches lines like:   [COLUMN NAME]		Text (510),
 COL_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s+(?P<type>.+?)\s*,?\s*$")
@@ -57,9 +69,9 @@ def start_year(db_filename: str) -> str:
     return m.group(1)
 
 
-def access_to_duckdb_type(access_type: str) -> str:
+def access_to_pg_type(access_type: str) -> str:
     """Map an Access type token, ignoring size '(...)' and a 'NOT NULL' suffix."""
-    base = re.sub(r"\s*\(.*?\)", "", access_type)        # drop size, e.g. Text (510)
+    base = re.sub(r"\s*\(.*?\)", "", access_type)  # drop size, e.g. Text (510)
     base = re.sub(r"\s+NOT\s+NULL\s*$", "", base, flags=re.I)  # drop NOT NULL
     base = base.strip()
     if base not in TYPE_MAP:
@@ -68,10 +80,12 @@ def access_to_duckdb_type(access_type: str) -> str:
 
 
 def get_schema(db_path: str, table: str) -> dict[str, str]:
-    """Return {column_name: duckdb_type} for one table, in column order."""
+    """Return {column_name: postgres_type} for one table, in column order."""
     out = subprocess.run(
         ["mdb-schema", "-T", table, db_path],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
 
     # Keep only the lines between the opening '(' and the closing ');'.
@@ -86,31 +100,30 @@ def get_schema(db_path: str, table: str) -> dict[str, str]:
             break
         m = COL_RE.match(line)
         if m:
-            cols[m.group("name")] = access_to_duckdb_type(m.group("type"))
+            cols[m.group("name")] = access_to_pg_type(m.group("type"))
     if not cols:
         raise ValueError(f"No columns parsed for {table} in {db_path}")
     return cols
 
 
-def columns_struct(cols: dict[str, str]) -> str:
-    """Render a duckdb struct literal for read_csv's `columns=` argument."""
-    inner = ", ".join(f"'{name}': '{dtype}'" for name, dtype in cols.items())
-    return "{" + inner + "}"
+def column_defs(cols: dict[str, str]) -> str:
+    """Render CREATE TABLE column definitions, lowercasing column names."""
+    return ", ".join(f'"{name.lower()}" {dtype}' for name, dtype in cols.items())
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ingest IPEDS Access DBs into duckdb.")
-    parser.add_argument("--accdb-dir", default="./data/accdb/", help="Directory containing .accdb files (default: ./data/accdb/)")
-    parser.add_argument("--db", default=DB_PATH, help=f"Output duckdb path (default: {DB_PATH})")
-    args = parser.parse_args()
+    con = psycopg.connect(DATABASE_URL)
+    con.autocommit = True
 
-    adbs_path = args.accdb_dir
-    db_path = args.db
+    existing = con.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_schema = 'public' AND table_name LIKE 'y%'"
+    ).fetchone()
+    if existing is not None and existing[0]:
+        raise SystemExit(
+            f"Database already has {existing} y* tables; drop them first to re-ingest."
+        )
 
-    if os.path.exists(db_path):
-        raise SystemExit(f"{db_path} already exists; remove it first to re-ingest.")
-
-    con = duckdb.connect(db_path)
     seen: dict[str, str] = {}  # table -> source db, to catch name collisions
 
     dbs = sorted(os.listdir(adbs_path))
@@ -118,8 +131,10 @@ def main() -> None:
         accdb = os.path.join(adbs_path, db)
         year = start_year(db)
         tables = subprocess.run(
-            ["mdb-tables", "-1", accdb],
-            capture_output=True, text=True, check=True,
+            ["mdb-tables", "-1", db_path],
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout.split()
 
         for table in tqdm(tables, desc=db, leave=False):
@@ -133,31 +148,25 @@ def main() -> None:
                 )
             seen[dest] = accdb
 
-            cols = get_schema(accdb, table)
+            cols = get_schema(db_path, table)
+            con.execute(f'CREATE TABLE "{dest}" ({column_defs(cols)})')
 
             csv = subprocess.run(
-                ["mdb-export", "-D", DATE_FMT, "-q", '"', "-X", '"', accdb, table],
-                capture_output=True, text=True, check=True,
+                ["mdb-export", "-D", DATE_FMT, "-q", '"', "-X", '"', db_path, table],
+                capture_output=True,
+                text=True,
+                check=True,
             ).stdout
 
-            with tempfile.NamedTemporaryFile(
-                "w", suffix=".csv", delete=False, encoding="utf-8"
-            ) as fh:
-                fh.write(csv)
-                tmp = fh.name
-            try:
-                con.execute(
-                    f'CREATE TABLE "{dest}" AS SELECT * FROM read_csv('
-                    f"'{tmp}', header=true, "
-                    f"columns={columns_struct(cols)}, "
-                    f"nullstr='', quote='\"', escape='\"', "
-                    f"timestampformat='{DATE_FMT}')"
-                )
-            finally:
-                os.unlink(tmp)
+            with con.cursor() as cur:
+                with cur.copy(
+                    f'COPY "{dest}" FROM STDIN WITH (FORMAT csv, HEADER true, '
+                    "NULL '', QUOTE '\"', ESCAPE '\"')"
+                ) as copy:
+                    copy.write(csv)
 
     con.close()
-    print(f"Done. Ingested {len(seen)} tables into {db_path}.")
+    print(f"Done. Ingested {len(seen)} tables into {DATABASE_URL.rsplit('/', 1)[-1]}.")
 
 
 if __name__ == "__main__":

@@ -13,3 +13,7 @@ wheels/
 .env
 
 data/
+
+# Database artifacts
+ipeds.db
+*.dump
