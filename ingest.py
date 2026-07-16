@@ -15,12 +15,16 @@ import re
 import subprocess
 
 import psycopg
+from dotenv import load_dotenv
 from tqdm import tqdm
 
-ADBS_PATH = "../../data/ipeds_all/accdb/"
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://postgres:ipeds_pg@localhost:5432/ipeds_db"
-)
+# Load configuration (DATABASE_URL, ...) from a local .env if one is present.
+load_dotenv()
+
+ADBS_PATH = "./data/accdb/"
+# No hardcoded fallback: the connection URL (with credentials) must come from the
+# environment / .env so secrets never live in source. See .env.example.
+DATABASE_URL = os.environ.get("DATABASE_URL")
 # Fixed date format we ask mdb-export to emit; matches Postgres timestamp input.
 DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -57,16 +61,6 @@ METADATA_TABLES = [
 
 # Matches lines like:   [COLUMN NAME]		Text (510),
 COL_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s+(?P<type>.+?)\s*,?\s*$")
-
-# Filename like IPEDS200405.accdb -> start year 2004.
-YEAR_RE = re.compile(r"(\d{4})\d{2}")
-
-
-def start_year(db_filename: str) -> str:
-    m = YEAR_RE.search(db_filename)
-    if not m:
-        raise ValueError(f"Could not parse year from {db_filename!r}")
-    return m.group(1)
 
 
 def access_to_pg_type(access_type: str) -> str:
@@ -111,34 +105,67 @@ def column_defs(cols: dict[str, str]) -> str:
     return ", ".join(f'"{name.lower()}" {dtype}' for name, dtype in cols.items())
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Ingest IPEDS Access DBs into Postgres.")
+    p.add_argument(
+        "--accdb-dir",
+        default=ADBS_PATH,
+        help="Directory containing the IPEDS .accdb files.",
+    )
+    p.add_argument(
+        "--database-url",
+        default=DATABASE_URL,
+        help="Postgres connection URL (defaults to $DATABASE_URL or the built-in default).",
+    )
+    return p.parse_args()
+
+
 def main() -> None:
-    con = psycopg.connect(DATABASE_URL)
+    args = parse_args()
+    if not args.database_url:
+        raise SystemExit(
+            "DATABASE_URL is not set. Add it to a .env file (see .env.example) "
+            "or pass --database-url."
+        )
+    # The target database must already exist; we don't create it. Fail loud with a
+    # hint if it's unreachable (wrong URL, server down, or DB not created yet).
+    try:
+        con = psycopg.connect(args.database_url)
+    except psycopg.OperationalError as e:
+        raise SystemExit(
+            f"Could not connect to the database: {e}\n"
+            "Check DATABASE_URL, and create the database first if it doesn't exist "
+            "(e.g. `createdb <dbname>`)."
+        ) from e
     con.autocommit = True
 
+    # Table names are unprefixed (IPEDS names are already globally unique); metadata
+    # tables carry a '_meta' suffix, so their presence marks an existing ingest.
     existing = con.execute(
         "SELECT count(*) FROM information_schema.tables "
-        "WHERE table_schema = 'public' AND table_name LIKE 'y%'"
+        "WHERE table_schema = 'public' AND table_name LIKE '%!_meta' ESCAPE '!'"
     ).fetchone()
     if existing is not None and existing[0]:
         raise SystemExit(
-            f"Database already has {existing} y* tables; drop them first to re-ingest."
+            f"Database already has {existing[0]} *_meta tables; drop them first to re-ingest."
         )
 
     seen: dict[str, str] = {}  # table -> source db, to catch name collisions
 
-    dbs = sorted(os.listdir(adbs_path))
+    dbs = sorted(f for f in os.listdir(args.accdb_dir) if f.lower().endswith(".accdb"))
     for db in tqdm(dbs, desc="years"):
-        accdb = os.path.join(adbs_path, db)
-        year = start_year(db)
+        accdb = os.path.join(args.accdb_dir, db)
         tables = subprocess.run(
-            ["mdb-tables", "-1", db_path],
+            ["mdb-tables", "-1", accdb],
             capture_output=True,
             text=True,
             check=True,
         ).stdout.split()
 
         for table in tqdm(tables, desc=db, leave=False):
-            dest = f"y{year}_{table}"
+            # Keep the original IPEDS name (it already embeds the year and is unique);
+            # metadata tables get a '_meta' suffix to set them apart from data tables.
+            dest = table
             if table[:-2].lower() in METADATA_TABLES:
                 dest += "_meta"
             if dest in seen:
@@ -148,11 +175,11 @@ def main() -> None:
                 )
             seen[dest] = accdb
 
-            cols = get_schema(db_path, table)
+            cols = get_schema(accdb, table)
             con.execute(f'CREATE TABLE "{dest}" ({column_defs(cols)})')
 
             csv = subprocess.run(
-                ["mdb-export", "-D", DATE_FMT, "-q", '"', "-X", '"', db_path, table],
+                ["mdb-export", "-D", DATE_FMT, "-q", '"', "-X", '"', accdb, table],
                 capture_output=True,
                 text=True,
                 check=True,
@@ -166,7 +193,7 @@ def main() -> None:
                     copy.write(csv)
 
     con.close()
-    print(f"Done. Ingested {len(seen)} tables into {DATABASE_URL.rsplit('/', 1)[-1]}.")
+    print(f"Done. Ingested {len(seen)} tables into {args.database_url.rsplit('/', 1)[-1]}.")
 
 
 if __name__ == "__main__":
