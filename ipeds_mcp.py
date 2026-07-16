@@ -9,8 +9,10 @@ DATABASE_URL = os.environ.get(
 SERVER_CONTEXT = """
 This server provides read-only access to a PostgreSQL database containing 20 years of IPEDS data from
 2004-05 to 2023-24. Data tables keep their original IPEDS names, which already embed the year
-(e.g. HD2023, EFFY2023). Their names and column names are mixed/upper case, so quote them in SQL
-(e.g. SELECT "INSTNM" FROM "HD2023"). The database also contains rich metadata tables for each year
+(e.g. HD2023, EFFY2023). Data table NAMES are mixed/upper case and must be double-quoted, but their
+COLUMN names are all lowercase; never upper-case-quote a column (e.g. SELECT unitid, instnm
+FROM "HD2023" is correct; SELECT "UNITID" FROM "HD2023" fails).
+The database also contains rich metadata tables for each year
 describing the data tables in detail. All the metadata tables have a suffix "_meta" and embed the
 two-digit year (e.g. tables23_meta). Metadata table names and their column names are all lowercase.
 The main metadata tables of interest are:
@@ -21,12 +23,22 @@ The main metadata tables of interest are:
 - newvariables<YY>_meta - not all the years have this. Contains a list of new variables that were added in the given year.
 """
 
-mcp = FastMCP("IPEDS_Navigator", instructions=SERVER_CONTEXT)
+mcp = FastMCP(
+    "IPEDS_Navigator",
+    instructions=SERVER_CONTEXT,
+    # Bind all interfaces so the server is reachable from outside the container.
+    host="0.0.0.0",
+    port=8000,
+)
 
 
 def get_connection():
     # Read-only enforced at the session level; the SQL tool also gates on SELECT/WITH.
-    con = psycopg.connect(DATABASE_URL, options="-c default_transaction_read_only=on")
+    con = psycopg.connect(
+        DATABASE_URL,
+        options="-c default_transaction_read_only=on",
+        connect_timeout=10,
+    )
     con.autocommit = True
     return con
 
@@ -174,4 +186,4 @@ def lookup_valueset(year: int, table: str, var_name: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="streamable-http")

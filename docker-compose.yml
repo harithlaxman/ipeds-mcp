@@ -1,0 +1,15 @@
+services:
+  mcp:
+    build: .
+    image: ipeds-mcp
+    ports:
+      - "8000:8000"
+    environment:
+      # Points at the AWS-hosted Postgres. Set DATABASE_URL in the environment
+      # (or a .env file next to this compose file); startup fails if it's unset.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to the Postgres connection string}
+    # Lets the container reach a Postgres running on the Docker host during local
+    # testing via host.docker.internal (unused/harmless when pointing at a remote DB).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
