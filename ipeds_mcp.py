@@ -1,5 +1,4 @@
 import os
-import re
 
 import psycopg
 from mcp.server.fastmcp import FastMCP
@@ -7,19 +6,19 @@ from mcp.server.fastmcp import FastMCP
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://postgres:ipeds_pg@localhost:5432/ipeds_db"
 )
-_YEAR_PREFIX_RE = re.compile(r"^y\d{4}_", re.IGNORECASE)
 SERVER_CONTEXT = """
 This server provides read-only access to a PostgreSQL database containing 20 years of IPEDS data from
-2004-05 to 2023-24. The database contains rich metadata tables for each year describing the data tables
-in detail. All the tables have a prefix "y<YYYY>" to indicate the year. All the metadata tables have a
-suffix "_meta". For example, y2023_Tables23_meta. Table names are mixed case, so quote them in SQL
-(e.g. SELECT * FROM "y2023_HD2023"). Column names are all lowercase. The main metadata tables of
-interest are:
-- y<YYYY>_Tables<YY>_meta - Contains a list of all the tables for the year along with a description.
-- y<YYYY>_varTable<YY>_meta - Contains a list of all the variables in each table along with a description of the variable and data type.
-- y<YYYY>_valueSets<YY>_meta - Contains a list of all the possible values for each categorical variable.
-    E.g. to understand categorical numbers like 1=Public, 2=Private, check the y<YYYY>_valueSets<YY>_meta table.
-- y<YYYY>_newVariables<YY>_meta - not all the years have this. Contains a list of new variables that were added in the given year.
+2004-05 to 2023-24. Data tables keep their original IPEDS names, which already embed the year
+(e.g. HD2023, EFFY2023). Their names and column names are mixed/upper case, so quote them in SQL
+(e.g. SELECT "INSTNM" FROM "HD2023"). The database also contains rich metadata tables for each year
+describing the data tables in detail. All the metadata tables have a suffix "_meta" and embed the
+two-digit year (e.g. tables23_meta). Metadata table names and their column names are all lowercase.
+The main metadata tables of interest are:
+- tables<YY>_meta - Contains a list of all the tables for the year along with a description.
+- vartable<YY>_meta - Contains a list of all the variables in each table along with a description of the variable and data type.
+- valuesets<YY>_meta - Contains a list of all the possible values for each categorical variable.
+    E.g. to understand categorical numbers like 1=Public, 2=Private, check the valuesets<YY>_meta table.
+- newvariables<YY>_meta - not all the years have this. Contains a list of new variables that were added in the given year.
 """
 
 mcp = FastMCP("IPEDS_Navigator", instructions=SERVER_CONTEXT)
@@ -33,11 +32,14 @@ def get_connection():
 
 
 def _find_meta_table(con, year: int, pattern: str) -> str | None:
+    # Metadata tables embed the two-digit year and carry a '_meta' suffix,
+    # e.g. vartable23_meta. Matched case-insensitively to be safe.
+    yy = str(year)[2:]
     row = con.execute(
         "SELECT table_name FROM information_schema.tables "
-        "WHERE table_schema = 'public' AND lower(table_name) LIKE lower(%s) "
+        "WHERE table_schema = 'public' AND lower(table_name) LIKE lower(%s) ESCAPE '!' "
         "LIMIT 1",
-        [f"y{year}_%{pattern}%"],
+        [f"%{pattern}%{yy}!_meta"],
     ).fetchone()
     return row[0] if row else None
 
@@ -45,12 +47,12 @@ def _find_meta_table(con, year: int, pattern: str) -> str | None:
 @mcp.tool()
 def get_meta_tables_by_year(year: int) -> list[str]:
     """Get a list of tables that contain meta data for a given year"""
+    yy = str(year)[2:]
     with get_connection() as con:
         rows = con.execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_name LIKE %s "
-            "AND table_name LIKE '%%meta'",
-            [f"y{year}%"],
+            "WHERE table_schema = 'public' AND table_name LIKE %s ESCAPE '!'",
+            [f"%{yy}!_meta"],
         ).fetchall()
     return [r[0] for r in rows]
 
@@ -58,33 +60,34 @@ def get_meta_tables_by_year(year: int) -> list[str]:
 @mcp.tool()
 def get_table_descriptions_by_year(year: int) -> dict:
     """Get descriptions for each table that exist for a given year
-    Uses the meta table y<YYYY>_Tables<YY>_meta
+    Uses the meta table tables<YY>_meta
     """
     with get_connection() as con:
+        t_table = _find_meta_table(con, year, "tables")
+        if t_table is None:
+            return {}
         rows = con.execute(
-            f'SELECT tablename, tabletitle, description FROM "y{year}_Tables{str(year)[2:]}_meta"'
+            f'SELECT tablename, tabletitle, description FROM "{t_table}"'
         ).fetchall()
-    return {f"y{year}_{name}": f"{title}\n{desc}" for name, title, desc in rows}
+    return {name: f"{title}\n{desc}" for name, title, desc in rows}
 
 
 @mcp.tool()
 def get_column_descriptions_of_table(year: int, table: str) -> dict:
     """Get descriptions for each column in a given table for a given year.
     Returns a dict keyed by VarName with fields: tablename, varnumber, vartitle, longdescription.
-    Accepts either a qualified name ('y2023_HD2023') or a raw name ('HD2023').
+    Pass the raw IPEDS table name, e.g. 'HD2023'.
     """
     with get_connection() as con:
         vt_table = _find_meta_table(con, year, "vartable")
         if vt_table is None:
             return {}
 
-        raw_table = _YEAR_PREFIX_RE.sub("", table.strip())
-
         rows = con.execute(
             f'SELECT tablename, varnumber, varname, vartitle, longdescription FROM "{vt_table}" '
             "WHERE lower(tablename) = lower(%s) "
             "ORDER BY varorder, varnumber",
-            [raw_table],
+            [table.strip()],
         ).fetchall()
 
     return {
@@ -103,7 +106,7 @@ def execute_readonly_sql(sql: str) -> str:
     """
     Executes a read-only SELECT query against the PostgreSQL database to fetch actual data.
     The session is read-only, so INSERT/UPDATE/DELETE will fail.
-    Table names are mixed case and must be double-quoted, e.g. SELECT * FROM "y2023_HD2023".
+    Table names are mixed case and must be double-quoted, e.g. SELECT * FROM "HD2023".
     Column names are all lowercase.
     """
     # Additional app-level safety check
@@ -140,8 +143,7 @@ def lookup_valueset(year: int, table: str, var_name: str) -> str:
 
     Args:
         year: The IPEDS survey start year, e.g. 2023.
-        table: The data table that contains the column. Either a qualified name
-            ("y2023_HD2023") or a raw name ("HD2023") is accepted.
+        table: The data table that contains the column, e.g. "HD2023".
         var_name: The column (variable) name whose value set you want, e.g. "CONTROL".
     """
     with get_connection() as con:
@@ -150,8 +152,7 @@ def lookup_valueset(year: int, table: str, var_name: str) -> str:
         if vs_table is None:
             return f"No valuesets table found for year {year}."
 
-        # Strip year prefix so the lookup matches the raw TableName stored in valuesets.
-        raw_table = _YEAR_PREFIX_RE.sub("", table.strip())
+        raw_table = table.strip()
 
         rows = con.execute(
             f'SELECT codevalue, valuelabel FROM "{vs_table}" '

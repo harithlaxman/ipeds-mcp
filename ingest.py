@@ -5,8 +5,10 @@ sampling the CSV. Postgres then loads the exported CSV via COPY with that schema
 forced, so no per-table type guessing happens and the same column has the same
 type in every year's table.
 
-Column names are lowercased so unquoted identifiers resolve in queries; table
-names keep their original mixed case (always quote them).
+Data tables keep their original IPEDS table and column casing (already consistent
+across years). Metadata tables drift in casing between years, so their names and
+columns are lowercased for a uniform schema. Table names are mixed case in general,
+so always quote them.
 """
 
 import argparse
@@ -15,6 +17,7 @@ import re
 import subprocess
 
 import psycopg
+from psycopg import sql
 from dotenv import load_dotenv
 from tqdm import tqdm
 
@@ -100,9 +103,21 @@ def get_schema(db_path: str, table: str) -> dict[str, str]:
     return cols
 
 
-def column_defs(cols: dict[str, str]) -> str:
-    """Render CREATE TABLE column definitions, lowercasing column names."""
-    return ", ".join(f'"{name.lower()}" {dtype}' for name, dtype in cols.items())
+def column_defs(cols: dict[str, str], lower: bool = False) -> sql.Composed:
+    """Render CREATE TABLE column definitions.
+
+    Data-table columns keep their original IPEDS casing; metadata columns are
+    lowercased (lower=True) so their names are consistent across years.
+
+    Column names go through sql.Identifier for proper quoting; the Postgres type
+    comes from the controlled TYPE_MAP, so it is injected as raw SQL.
+    """
+    return sql.SQL(", ").join(
+        sql.SQL("{} {}").format(
+            sql.Identifier(name.lower() if lower else name), sql.SQL(dtype)
+        )
+        for name, dtype in cols.items()
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -163,11 +178,14 @@ def main() -> None:
         ).stdout.split()
 
         for table in tqdm(tables, desc=db, leave=False):
-            # Keep the original IPEDS name (it already embeds the year and is unique);
-            # metadata tables get a '_meta' suffix to set them apart from data tables.
-            dest = table
-            if table[:-2].lower() in METADATA_TABLES:
-                dest += "_meta"
+            # Data tables keep their original IPEDS name and column casing (already
+            # consistent across years). Metadata table names drift in casing across
+            # years, so they get a '_meta' suffix and are fully lowercased (name and
+            # columns) for a uniform schema when exploring information_schema.
+            is_meta = table[:-2].lower() in METADATA_TABLES
+            dest = table + "_meta" if is_meta else table
+            if is_meta:
+                dest = dest.lower()
             if dest in seen:
                 raise SystemExit(
                     f"Duplicate table name {dest!r} in {accdb} "
@@ -176,7 +194,11 @@ def main() -> None:
             seen[dest] = accdb
 
             cols = get_schema(accdb, table)
-            con.execute(f'CREATE TABLE "{dest}" ({column_defs(cols)})')
+            con.execute(
+                sql.SQL("CREATE TABLE {} ({})").format(
+                    sql.Identifier(dest), column_defs(cols, lower=is_meta)
+                )
+            )
 
             csv = subprocess.run(
                 ["mdb-export", "-D", DATE_FMT, "-q", '"', "-X", '"', accdb, table],
@@ -187,8 +209,10 @@ def main() -> None:
 
             with con.cursor() as cur:
                 with cur.copy(
-                    f'COPY "{dest}" FROM STDIN WITH (FORMAT csv, HEADER true, '
-                    "NULL '', QUOTE '\"', ESCAPE '\"')"
+                    sql.SQL(
+                        "COPY {} FROM STDIN WITH (FORMAT csv, HEADER true, "
+                        "NULL '', QUOTE '\"', ESCAPE '\"')"
+                    ).format(sql.Identifier(dest))
                 ) as copy:
                     copy.write(csv)
 
