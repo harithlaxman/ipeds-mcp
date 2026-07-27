@@ -8,6 +8,20 @@ and creates a MCP to navigate the database.
 - mdb-tools (refer to installation guide - https://github.com/mdbtools/mdbtools)
 - uv (https://docs.astral.sh/uv/getting-started/installation)
 
+### Fetch IPEDS databases
+`fetch_db.sh` downloads IPEDS Access Database archives and extracts their `.accdb` files.
+
+Check the [IPEDS download page](https://nces.ed.gov/ipeds/use-the-data/download-access-database) to confirm which academic years are available.
+
+Download one year or an inclusive range, optionally choosing an output directory:
+```sh
+./fetch_db.sh 2023
+./fetch_db.sh --range 2004 2023
+./fetch_db.sh --range 2004 2023 --out PATH_TO_ACCDB_DIR
+```
+
+Files are written to `./data/accdb` by default.
+
 ### Setup
 Install Dependencies
 `uv sync`

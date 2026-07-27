@@ -2,72 +2,96 @@
 #
 # Download IPEDS Access DB zips and extract the .accdb file from each.
 #
-# IPEDS Access DBs are published per academic year (2004-05 .. 2023-24) at:
+# IPEDS Access DBs are published per academic year at:
 #   https://nces.ed.gov/ipeds/tablefiles/zipfiles/IPEDS_<YYYY>-<YY+1>_Final.zip
 # Each zip holds one .accdb (e.g. IPEDS200405.accdb) plus other files we don't
 # need. We keep only the .accdb and drop everything else.
 #
 # Usage:
-#   ./download.sh <year>            # one year, e.g. 2011
-#   ./download.sh -all              # all years 2004..2023
-#   ./download.sh <year|-all> -o <dir>   # output dir (default: ./data)
+#   ./fetch_db.sh <year>                              # one year, e.g. 2011
+#   ./fetch_db.sh --range <first_year> <last_year>    # inclusive range
+#   ./fetch_db.sh <year|--range ...> -o <dir>         # custom output dir
 
 set -euo pipefail
 
-FIRST_YEAR=2004
-LAST_YEAR=2023
+FIRST_YEAR=""
+LAST_YEAR=""
 BASE_URL="https://nces.ed.gov/ipeds/tablefiles/zipfiles"
 
 usage() {
     cat >&2 <<EOF
-Usage: $(basename "$0") (<year> | -all) [-o <out_dir>]
+Usage: $(basename "$0") (<year> | --range <first_year> <last_year>) [-o <out_dir>]
 
-  <year>          a single year to download, ${FIRST_YEAR}..${LAST_YEAR}
-  -all, --all     download every year from ${FIRST_YEAR} to ${LAST_YEAR}
-  -o, --out <dir> output directory for .accdb files (default: ./data)
+  <year>                    a single four-digit year to download
+  --range <first> <last>    download an inclusive range of four-digit years
+  -o, --out <dir>           output directory for .accdb files (default: ./data/accdb)
 EOF
     exit 2
 }
 
 # --- parse args ------------------------------------------------------------
 YEAR=""
-ALL=false
 OUT="data/accdb"
 
+# Process command-line arguments, consuming each one with shift.
 while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -all|--all)
-            ALL=true
-            shift
+    arg="$1"
+
+    case "$arg" in
+        --range)
+            if [[ $# -lt 3 ]]; then
+                echo "error: $arg needs first and last year arguments" >&2
+                usage
+            fi
+            if [[ ! "$2" =~ ^[0-9]{4}$ || ! "$3" =~ ^[0-9]{4}$ ]]; then
+                echo "error: --range years must each contain four digits" >&2
+                usage
+            fi
+            if [[ -n "$FIRST_YEAR" ]]; then
+                echo "error: multiple ranges given" >&2
+                usage
+            fi
+
+            FIRST_YEAR="$2"
+            LAST_YEAR="$3"
+            shift 3
             ;;
         -o|--out)
-            [[ $# -ge 2 ]] || { echo "error: $1 needs a directory argument" >&2; usage; }
+            if [[ $# -lt 2 ]]; then
+                echo "error: $arg needs a directory argument" >&2
+                usage
+            fi
+
             OUT="$2"
             shift 2
             ;;
         [0-9][0-9][0-9][0-9])
-            [[ -z "$YEAR" ]] || { echo "error: multiple years given" >&2; usage; }
-            YEAR="$1"
+            if [[ -n "$YEAR" ]]; then
+                echo "error: multiple years given" >&2
+                usage
+            fi
+
+            YEAR="$arg"
             shift
             ;;
         *)
-            echo "error: unrecognized argument: $1" >&2
+            echo "error: unrecognized argument: $arg" >&2
             usage
             ;;
     esac
 done
 
-# Require exactly one of <year> / -all.
-if $ALL && [[ -n "$YEAR" ]]; then
-    echo "error: give either a year or -all, not both" >&2
+# Require exactly one of <year> / --range.
+if [[ -n "$YEAR" && -n "$FIRST_YEAR" ]]; then
+    echo "error: give either a year or --range, not both" >&2
     usage
 fi
-if ! $ALL && [[ -z "$YEAR" ]]; then
-    echo "error: provide a year or -all" >&2
+if [[ -z "$YEAR" && -z "$FIRST_YEAR" ]]; then
+    echo "error: provide a year or --range" >&2
     usage
 fi
-if [[ -n "$YEAR" ]] && { (( YEAR < FIRST_YEAR )) || (( YEAR > LAST_YEAR )); }; then
-    echo "error: year must be between ${FIRST_YEAR} and ${LAST_YEAR}" >&2
+if [[ -n "$FIRST_YEAR" ]] && (( 10#${FIRST_YEAR} > 10#${LAST_YEAR} )); then
+    echo "error: first year must not be later than last year" >&2
     usage
 fi
 
@@ -97,7 +121,7 @@ download_year() {
 # --- main ------------------------------------------------------------------
 mkdir -p "$OUT"
 
-if $ALL; then
+if [[ -n "$FIRST_YEAR" ]]; then
     failures=0
     for year in $(seq "$FIRST_YEAR" "$LAST_YEAR"); do
         download_year "$year" || failures=$((failures + 1))
@@ -106,7 +130,7 @@ if $ALL; then
         echo "finished with ${failures} failed year(s)" >&2
         exit 1
     fi
-    echo "All years downloaded into ${OUT}/"
+    echo "Downloaded years ${FIRST_YEAR} through ${LAST_YEAR} into ${OUT}/"
 else
     download_year "$YEAR"
     echo "Downloaded into ${OUT}/"
