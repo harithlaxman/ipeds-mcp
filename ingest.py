@@ -9,6 +9,10 @@ Data tables keep their original IPEDS table and column casing (already consisten
 across years). Metadata tables drift in casing between years, so their names and
 columns are lowercased for a uniform schema. Table names are mixed case in general,
 so always quote them.
+
+The NCES-derived rollup tables (DRV*, DFR*) are not ingested, and the rows
+describing them are dropped from the Tables{YY} metadata tables so the catalog
+only advertises tables that actually exist; see EXCLUDED_PREFIXES.
 """
 
 import argparse
@@ -17,8 +21,8 @@ import re
 import subprocess
 
 import psycopg
-from psycopg import sql
 from dotenv import load_dotenv
+from psycopg import sql
 from tqdm import tqdm
 
 # Load configuration (DATABASE_URL, ...) from a local .env if one is present.
@@ -61,6 +65,11 @@ METADATA_TABLES = [
     "vartable",
     "newvariables",
 ]
+
+# NCES-computed rollups over the survey tables (DRV*, and the older DFR* Data
+# Feedback Report tables that DRV* replaced in 2006-07). Not source data, so
+# they are skipped on ingest.
+EXCLUDED_PREFIXES = ("DRV", "DFR")
 
 # Matches lines like:   [COLUMN NAME]		Text (510),
 COL_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s+(?P<type>.+?)\s*,?\s*$")
@@ -178,11 +187,15 @@ def main() -> None:
         ).stdout.split()
 
         for table in tqdm(tables, desc=db, leave=False):
+            if table.upper().startswith(EXCLUDED_PREFIXES):
+                continue
+
             # Data tables keep their original IPEDS name and column casing (already
             # consistent across years). Metadata table names drift in casing across
             # years, so they get a '_meta' suffix and are fully lowercased (name and
             # columns) for a uniform schema when exploring information_schema.
-            is_meta = table[:-2].lower() in METADATA_TABLES
+            meta_kind = table[:-2].lower()  # e.g. 'Tables23' -> 'tables'
+            is_meta = meta_kind in METADATA_TABLES
             dest = table + "_meta" if is_meta else table
             if is_meta:
                 dest = dest.lower()
@@ -207,17 +220,32 @@ def main() -> None:
                 check=True,
             ).stdout
 
-            with con.cursor() as cur:
-                with cur.copy(
+            with (
+                con.cursor() as cur,
+                cur.copy(
                     sql.SQL(
                         "COPY {} FROM STDIN WITH (FORMAT csv, HEADER true, "
                         "NULL '', QUOTE '\"', ESCAPE '\"')"
                     ).format(sql.Identifier(dest))
-                ) as copy:
-                    copy.write(csv)
+                ) as copy,
+            ):
+                copy.write(csv)
+
+            # The DRV*/DFR* data tables are skipped above, so drop the catalog rows
+            # describing them; otherwise the metadata advertises tables that aren't
+            # in the database. upper() guards against casing drift across years.
+            if meta_kind == "tables":
+                con.execute(
+                    sql.SQL(
+                        "DELETE FROM {} WHERE upper(tablename) LIKE ANY(%s)"
+                    ).format(sql.Identifier(dest)),
+                    [[p + "%" for p in EXCLUDED_PREFIXES]],
+                )
 
     con.close()
-    print(f"Done. Ingested {len(seen)} tables into {args.database_url.rsplit('/', 1)[-1]}.")
+    print(
+        f"Done. Ingested {len(seen)} tables into {args.database_url.rsplit('/', 1)[-1]}."
+    )
 
 
 if __name__ == "__main__":
