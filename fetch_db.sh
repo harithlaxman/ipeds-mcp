@@ -103,18 +103,25 @@ download_year() {
     url="${BASE_URL}/IPEDS_${year}-${y1}_Final.zip"
 
     tmp=$(mktemp -d)
-    # Clean the scratch dir even if curl/unzip fails partway through.
-    trap 'rm -rf "$tmp"' RETURN
 
     echo "==> ${year}-${y1}: downloading"
     if ! curl -fSL --retry 3 -o "$tmp/ipeds.zip" "$url"; then
         echo "warning: failed to download ${url}" >&2
+        rm -rf "$tmp"
         return 1
     fi
 
     # -j junk paths (flatten), -o overwrite; the *.accdb filter keeps only the
-    # Access DB and leaves everything else in the zip behind.
-    unzip -o -j "$tmp/ipeds.zip" '*.accdb' -d "$OUT"
+    # Access DB and leaves everything else in the zip behind. A corrupt zip or one
+    # with no .accdb member is reported like a download failure, so a --range run
+    # counts it and carries on instead of aborting under `set -e`.
+    if ! unzip -o -j "$tmp/ipeds.zip" '*.accdb' -d "$OUT"; then
+        echo "warning: failed to extract an .accdb from ${url}" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    rm -rf "$tmp"
     echo "==> ${year}-${y1}: done"
 }
 

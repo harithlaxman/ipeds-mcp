@@ -1,13 +1,15 @@
 """Post-process the ingested Postgres DB: LLM-summarize table descriptions.
 
-Runs *after* `ingest.py`. For every ingested `Tables{YY}_meta` table it adds a
+Runs *after* `ingest.py`. For every ingested `tables{YY}_meta` table it adds a
 `description_summary` column (if absent) and fills it with a succinct,
 information-complete summary of the long free-text `description`, produced by
 Azure OpenAI.
 
 This is deliberately a separate, resumable step: it only touches rows where
 `description_summary IS NULL`, so a partial run (rate limit, timeout, Ctrl-C)
-can simply be re-run without re-ingesting or dropping anything.
+can simply be re-run without re-ingesting or dropping anything. Rows with an
+empty `description` have nothing to summarize and stay NULL, so they are
+re-examined (but not re-sent to the model) on every run.
 
 Config (from environment / a local .env):
     DATABASE_URL              Postgres connection URL (same one ingest.py uses).
@@ -92,7 +94,7 @@ def summarize_description(
 
 
 def find_tables_meta(con: psycopg.Connection) -> list[str]:
-    """Return the names of the ingested Tables metadata tables (e.g. 'Tables23_meta')."""
+    """Return the names of the ingested tables metadata tables (e.g. 'tables23_meta')."""
     rows = con.execute(
         "SELECT table_name FROM information_schema.tables "
         "WHERE table_schema = 'public' "
@@ -113,16 +115,18 @@ def summarize_table(
         ).format(sql.Identifier(table))
     )
     # Resumable: only rows not yet summarized. Title and year coverage are pulled in the
-    # same query so the model can avoid repeating what they already convey.
+    # same query so the model can avoid repeating what they already convey. ctid is the
+    # row's physical address: the early years have no key column at all, so it is the
+    # only way to update exactly the row we read (tablename is not guaranteed unique).
     rows = con.execute(
         sql.SQL(
-            "SELECT tablename, tabletitle, yearcoverage, description "
+            "SELECT ctid::text, tabletitle, yearcoverage, description "
             "FROM {} WHERE description_summary IS NULL"
         ).format(sql.Identifier(table))
     ).fetchall()
 
     updated = 0
-    for tablename, tabletitle, yearcoverage, description in tqdm(
+    for ctid, tabletitle, yearcoverage, description in tqdm(
         rows, desc=table, leave=False
     ):
         summary = summarize_description(
@@ -132,9 +136,9 @@ def summarize_table(
             continue
         con.execute(
             sql.SQL(
-                "UPDATE {} SET description_summary = %s WHERE tablename = %s"
+                "UPDATE {} SET description_summary = %s WHERE ctid = %s::tid"
             ).format(sql.Identifier(table)),
-            [summary, tablename],
+            [summary, ctid],
         )
         updated += 1
     return updated
@@ -177,7 +181,7 @@ def main() -> None:
     tables = find_tables_meta(con)
     if not tables:
         raise SystemExit(
-            "No 'Tables*_meta' tables found. Run ingest.py first (and check DATABASE_URL)."
+            "No 'tables*_meta' tables found. Run ingest.py first (and check DATABASE_URL)."
         )
 
     total = 0

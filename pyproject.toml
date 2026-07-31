@@ -1,13 +1,16 @@
 [project]
 name = "ipeds-mcp"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP server and ingest pipeline for exploring 20 years of IPEDS data in Postgres"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "fastmcp>=3.4.5",
+    # server.py uses the FastMCP bundled in the official MCP SDK
+    # (`from mcp.server.fastmcp import FastMCP`), not the standalone fastmcp package.
+    # 1.9 is the floor for the streamable-HTTP transport the server runs on.
+    "mcp>=1.9.0",
     "openai>=2.50.0",
-    "pandas>=3.0.5",
     "psycopg[binary]>=3.3.4",
+    "python-dotenv>=1.0.0",
     "tqdm>=4.70.0",
 ]
