@@ -6,6 +6,3 @@ __pycache__
 data/
 .git
 .gitignore
-*.dump
-ipeds.db
-uv.lock

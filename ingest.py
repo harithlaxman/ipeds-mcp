@@ -37,24 +37,24 @@ DATE_FMT = "%Y-%m-%d %H:%M:%S"
 
 # Access type (as printed by `mdb-schema`, default backend) -> Postgres type.
 TYPE_MAP = {
-    "Text": "VARCHAR",
-    "Memo/Hyperlink": "VARCHAR",
-    "GUID": "VARCHAR",
-    "Replication ID": "VARCHAR",
-    "Boolean": "BOOLEAN",
-    "Byte": "SMALLINT",
-    "Integer": "INTEGER",  # Access "Integer" is 16-bit; widen to be safe
-    "Long Integer": "INTEGER",
-    "Single": "REAL",
-    "Double": "DOUBLE PRECISION",
-    "Float": "DOUBLE PRECISION",
-    "Currency": "NUMERIC(19,4)",
-    "Numeric": "DOUBLE PRECISION",
-    "Decimal": "DOUBLE PRECISION",
-    "DateTime": "TIMESTAMP",
-    "DateTime (Short)": "TIMESTAMP",
-    "OLE": "BYTEA",
-    "Binary": "BYTEA",
+    "Text": sql.SQL("VARCHAR"),
+    "Memo/Hyperlink": sql.SQL("VARCHAR"),
+    "GUID": sql.SQL("VARCHAR"),
+    "Replication ID": sql.SQL("VARCHAR"),
+    "Boolean": sql.SQL("BOOLEAN"),
+    "Byte": sql.SQL("SMALLINT"),
+    "Integer": sql.SQL("INTEGER"),  # Access "Integer" is 16-bit; widen to be safe
+    "Long Integer": sql.SQL("INTEGER"),
+    "Single": sql.SQL("REAL"),
+    "Double": sql.SQL("DOUBLE PRECISION"),
+    "Float": sql.SQL("DOUBLE PRECISION"),
+    "Currency": sql.SQL("NUMERIC(19,4)"),
+    "Numeric": sql.SQL("DOUBLE PRECISION"),
+    "Decimal": sql.SQL("DOUBLE PRECISION"),
+    "DateTime": sql.SQL("TIMESTAMP"),
+    "DateTime (Short)": sql.SQL("TIMESTAMP"),
+    "OLE": sql.SQL("BYTEA"),
+    "Binary": sql.SQL("BYTEA"),
 }
 
 METADATA_TABLES = [
@@ -75,17 +75,17 @@ EXCLUDED_PREFIXES = ("DRV", "DFR")
 COL_RE = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s+(?P<type>.+?)\s*,?\s*$")
 
 
-def access_to_pg_type(access_type: str) -> str:
+def access_to_pg_type(access_type: str) -> sql.SQL:
     """Map an Access type token, ignoring size '(...)' and a 'NOT NULL' suffix."""
     base = re.sub(r"\s*\(.*?\)", "", access_type)  # drop size, e.g. Text (510)
-    base = re.sub(r"\s+NOT\s+NULL\s*$", "", base, flags=re.I)  # drop NOT NULL
+    base = re.sub(r"\s+NOT\s+NULL\s*$", "", base, flags=re.IGNORECASE)  # drop NOT NULL
     base = base.strip()
     if base not in TYPE_MAP:
         raise ValueError(f"Unmapped Access type: {access_type!r}")
     return TYPE_MAP[base]
 
 
-def get_schema(db_path: str, table: str) -> dict[str, str]:
+def get_schema(db_path: str, table: str) -> dict[str, sql.SQL]:
     """Return {column_name: postgres_type} for one table, in column order."""
     out = subprocess.run(
         ["mdb-schema", "-T", table, db_path],
@@ -95,7 +95,7 @@ def get_schema(db_path: str, table: str) -> dict[str, str]:
     ).stdout
 
     # Keep only the lines between the opening '(' and the closing ');'.
-    cols: dict[str, str] = {}
+    cols: dict[str, sql.SQL] = {}
     in_body = False
     for line in out.splitlines():
         if not in_body:
@@ -112,7 +112,7 @@ def get_schema(db_path: str, table: str) -> dict[str, str]:
     return cols
 
 
-def column_defs(cols: dict[str, str], lower: bool = False) -> sql.Composed:
+def column_defs(cols: dict[str, sql.SQL], lower: bool = False) -> sql.Composed:
     """Render CREATE TABLE column definitions.
 
     Data-table columns keep their original IPEDS casing; metadata columns are
@@ -123,7 +123,7 @@ def column_defs(cols: dict[str, str], lower: bool = False) -> sql.Composed:
     """
     return sql.SQL(", ").join(
         sql.SQL("{} {}").format(
-            sql.Identifier(name.lower() if lower else name), sql.SQL(dtype)
+            sql.Identifier(name.lower() if lower else name), dtype
         )
         for name, dtype in cols.items()
     )
