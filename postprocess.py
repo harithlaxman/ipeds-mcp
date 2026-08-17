@@ -155,8 +155,8 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--deployment",
-        default=os.environ.get("AZURE_OPENAI_DEPLOYMENT"),
-        help="Azure OpenAI deployment name (defaults to $AZURE_OPENAI_DEPLOYMENT).",
+        default=os.environ.get("AZURE_OPENAI_DEPLOYMENT_NAME"),
+        help="Azure OpenAI deployment name (defaults to $AZURE_OPENAI_DEPLOYMENT_NAME).",
     )
     return p.parse_args()
 
@@ -170,7 +170,7 @@ def main() -> None:
         )
     if not args.deployment:
         raise SystemExit(
-            "AZURE_OPENAI_DEPLOYMENT is not set. Add it to a .env file (see "
+            "AZURE_OPENAI_DEPLOYMENT_NAME is not set. Add it to a .env file (see "
             ".env.example) or pass --deployment."
         )
 
