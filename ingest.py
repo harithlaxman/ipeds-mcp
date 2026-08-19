@@ -1,20 +1,10 @@
-"""Ingest IPEDS Access DBs into Postgres, preserving the original Access column types.
+"""Ingest IPEDS Access DBs into Postgres, preserving original Access column types.
 
-Types come from `mdb-schema` (the real schema stored in the .accdb), not from
-sampling the CSV. Postgres then loads the exported CSV via COPY with that schema
-forced, so no per-table type guessing happens and the same column has the same
-type in every year's table.
-
-Data tables keep their original IPEDS table names (already consistent across
-years); metadata table names drift in casing between years, so they are
-lowercased and given a '_meta' suffix. Column names are lowercased everywhere so
-clients never have to quote a column. Table names are mixed case in general, so
-always quote them.
-
-The NCES-derived rollup tables (DRV*, DFR*) are not ingested, and the rows
-describing them are dropped from every metadata table that names tables, so the
-catalog only advertises tables that actually exist; see EXCLUDED_PREFIXES.
-Revised-data catalogs (e.g. Tables19_RV) are skipped entirely.
+Types come from `mdb-schema` (not CSV sampling), so the same column has the same
+type across years. Data tables keep original names; metadata tables get a
+'_meta' suffix. Column names are lowercased; table names stay mixed-case (quote them).
+DRV*/DFR* rollups and *_RV revised catalogs are skipped; catalog rows for dropped
+tables are removed so metadata only advertises ingested tables.
 """
 
 import argparse
@@ -68,14 +58,11 @@ METADATA_TABLES = [
     "newvariables",
 ]
 
-# NCES-computed rollups over the survey tables (DRV*, and the older DFR* Data
-# Feedback Report tables that DRV* replaced in 2006-07). Not source data, so
-# they are skipped on ingest.
+# NCES-computed rollups (DRV*, older DFR*). Not source data; skipped on ingest.
 EXCLUDED_PREFIXES = ("DRV", "DFR")
 
-# A metadata table is exactly one of METADATA_TABLES followed by a two-digit year,
-# e.g. 'Tables23'. Anchored so near-misses (notably the 'Tables19_RV' revised-data
-# catalog) are not mistaken for one and quietly ingested as a data table.
+# Metadata table: METADATA_TABLES + two-digit year (e.g. 'Tables23'). Anchored
+# so 'Tables19_RV' and other near-misses aren't ingested as data tables.
 _META_KINDS = "|".join(map(re.escape, METADATA_TABLES))
 META_RE = re.compile(rf"^(?:{_META_KINDS})\d{{2}}$", re.IGNORECASE)
 # Revised-data variants of the metadata catalogs; skipped entirely.
@@ -121,21 +108,13 @@ def get_schema(db_path: str, table: str) -> dict[str, sql.SQL]:
         raise ValueError(f"No columns parsed for {table} in {db_path}")
     return cols
 
-
 def column_defs(cols: dict[str, sql.SQL]) -> sql.Composed:
-    """Render CREATE TABLE column definitions.
-
-    Every column name is lowercased, in data and metadata tables alike, so
-    clients can write unquoted SQL (`SELECT unitid FROM "HD2023"`).
-
-    Column names go through sql.Identifier for proper quoting; the Postgres type
-    comes from the controlled TYPE_MAP, so it is injected as raw SQL.
-    """
+    """Render CREATE TABLE column definitions. Column names are lowercased
+    (so clients write unquoted SQL) and quoted via sql.Identifier."""
     return sql.SQL(", ").join(
         sql.SQL("{} {}").format(sql.Identifier(name.lower()), dtype)
         for name, dtype in cols.items()
     )
-
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Ingest IPEDS Access DBs into Postgres.")
@@ -153,11 +132,9 @@ def parse_args() -> argparse.Namespace:
         "--drop-existing",
         action="store_true",
         help=(
-            "Drop each destination table before creating it, instead of refusing to "
-            "run when a previous ingest is present. Use this to recover from a run "
-            "that failed partway through. It only drops tables this run recreates, "
-            "so tables left by an ingest that used different names must be dropped "
-            "by hand."
+            "Drop each destination table before creating it, instead of refusing"
+            " to run when a previous ingest is present. Only drops tables this"
+            " run recreates; others must be dropped by hand."
         ),
     )
     return p.parse_args()
@@ -170,8 +147,7 @@ def main() -> None:
             "DATABASE_URL is not set. Add it to a .env file (see .env.example) "
             "or pass --database-url."
         )
-    # The target database must already exist; we don't create it. Fail loud with a
-    # hint if it's unreachable (wrong URL, server down, or DB not created yet).
+    # The DB must already exist; fail loud with a hint if unreachable.
     try:
         con = psycopg.connect(args.database_url)
     except psycopg.OperationalError as e:
@@ -181,9 +157,7 @@ def main() -> None:
             "(e.g. `createdb <dbname>`)."
         ) from e
     con.autocommit = True
-
-    # Table names are unprefixed (IPEDS names are already globally unique); metadata
-    # tables carry a '_meta' suffix, so their presence marks an existing ingest.
+    # metadata tables carry '_meta'; their presence marks an existing ingest.
     existing = con.execute(
         "SELECT count(*) FROM information_schema.tables "
         "WHERE table_schema = 'public' AND table_name LIKE '%!_meta' ESCAPE '!'"
@@ -211,16 +185,13 @@ def main() -> None:
         for table in tqdm(tables, desc=db, leave=False):
             if table.upper().startswith(EXCLUDED_PREFIXES):
                 continue
-            # Revised-data catalogs duplicate the regular ones for a subset of rows;
-            # ingesting them would advertise a second catalog per year.
-            if META_RV_RE.match(table):
+            # Revised-data catalogs duplicate regular ones; skip to avoid a
+            # second catalog per year.
                 tqdm.write(f"skipping revised-data metadata table {table} in {db}")
                 continue
 
-            # Data tables keep their original IPEDS name (already consistent across
-            # years). Metadata table names drift in casing across years, so they get
-            # a '_meta' suffix and are lowercased for a uniform schema when exploring
-            # information_schema. Columns are lowercased everywhere (see column_defs).
+            # Data tables keep original names; metadata tables get '_meta' suffix
+            # and are lowercased. All columns are lowercased (see column_defs).
             is_meta = META_RE.match(table) is not None  # e.g. 'Tables23'
             dest = (table + "_meta").lower() if is_meta else table
             if dest in seen:
@@ -241,12 +212,8 @@ def main() -> None:
                 )
             )
 
-            # Stream mdb-export straight into COPY: the largest IPEDS tables are
-            # hundreds of MB, so the CSV is never held in memory as a whole. Bytes
-            # are passed through untouched; decoding them here would go through the
-            # process locale and mangle non-ASCII text. The exit code is checked
-            # *inside* the copy block so a dead mdb-export (which otherwise just
-            # looks like EOF) aborts the COPY instead of committing a partial table.
+            # Stream mdb-export into COPY: large tables never held in memory; raw
+            # bytes (decoding would mangle non-ASCII). Exit checked inside the block.
             with subprocess.Popen(
                 ["mdb-export", "-D", DATE_FMT, "-q", '"', "-X", '"', accdb, table],
                 stdout=subprocess.PIPE,
@@ -268,16 +235,23 @@ def main() -> None:
                             f"(exit {export.returncode}); see stderr above."
                         )
 
-            # The DRV*/DFR* data tables are skipped above, so drop the catalog rows
-            # describing them from every metadata table that names tables; otherwise
-            # the metadata advertises tables that aren't in the database. upper()
-            # guards against casing drift across years.
+            # Drop catalog rows for DRV*/DFR* tables (skipped above) so metadata
+            # only advertises ingested tables. upper() guards against casing drift.
             if is_meta and "tablename" in {c.lower() for c in cols}:
                 con.execute(
                     sql.SQL(
                         "DELETE FROM {} WHERE upper(tablename) LIKE ANY(%s)"
                     ).format(sql.Identifier(dest)),
                     [[p + "%" for p in EXCLUDED_PREFIXES]],
+                )
+            # Lowercase varname values to match lowercased data column names,
+            # so metadata keys the MCP server returns are directly usable in SQL.
+            if is_meta and "varname" in {c.lower() for c in cols}:
+                con.execute(
+                    sql.SQL(
+                        "UPDATE {} SET varname = lower(varname) "
+                        "WHERE varname IS NOT NULL AND varname != lower(varname)"
+                    ).format(sql.Identifier(dest))
                 )
 
     con.close()

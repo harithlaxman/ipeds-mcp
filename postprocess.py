@@ -1,15 +1,9 @@
 """Post-process the ingested Postgres DB: LLM-summarize table descriptions.
 
-Runs *after* `ingest.py`. For every ingested `tables{YY}_meta` table it adds a
-`description_summary` column (if absent) and fills it with a succinct,
-information-complete summary of the long free-text `description`, produced by
-Azure OpenAI.
-
-This is deliberately a separate, resumable step: it only touches rows where
-`description_summary IS NULL`, so a partial run (rate limit, timeout, Ctrl-C)
-can simply be re-run without re-ingesting or dropping anything. Rows with an
-empty `description` have nothing to summarize and stay NULL, so they are
-re-examined (but not re-sent to the model) on every run.
+Runs *after* `ingest.py`. For every `tables{YY}_meta` table, adds a
+`description_summary` column and fills it with a succinct Azure OpenAI summary
+of the long `description`. Resumable: only rows where `description_summary IS
+NULL` are processed, so a partial run can be re-run without re-ingesting.
 
 Config (from environment / a local .env):
     DATABASE_URL              Postgres connection URL (same one ingest.py uses).
@@ -108,16 +102,14 @@ def summarize_table(
     con: psycopg.Connection, client: AzureOpenAI, deployment: str, table: str
 ) -> int:
     """Add/populate `description_summary` for one meta table. Returns rows updated."""
-    # Idempotent: only adds the column if it isn't already there.
+    # Idempotent: only adds the column if absent.
     con.execute(
         sql.SQL(
             "ALTER TABLE {} ADD COLUMN IF NOT EXISTS description_summary TEXT"
         ).format(sql.Identifier(table))
     )
-    # Resumable: only rows not yet summarized. Title and year coverage are pulled in the
-    # same query so the model can avoid repeating what they already convey. ctid is the
-    # row's physical address: the early years have no key column at all, so it is the
-    # only way to update exactly the row we read (tablename is not guaranteed unique).
+    # Resumable: only unsummarized rows. ctid (physical row address) is the only
+    # way to update exact rows — early-year metadata tables have no PK.
     rows = con.execute(
         sql.SQL(
             "SELECT ctid::text, tabletitle, yearcoverage, description "
